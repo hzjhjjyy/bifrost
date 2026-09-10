@@ -145280,6 +145280,133 @@
           }
         }
       ]
+    },
+    {
+      "name": "76. OpenAI zero-retry transport regression",
+      "description": "Local-only transport fault tests. Start fixtures/retry-disconnect.py and configure retry-test as a custom OpenAI provider with max_retries=0 and its loopback base URL. Set retryFixtureUrl and include_preview=1. Each request reads its unique fixture record after the gateway returns; HTTP 502 alone cannot distinguish one upstream send from four. No infrastructure-error guard: 502 is the expected failure, and the request-count assertion is the regression.",
+      "item": [
+        {
+          "name": "76.01 openai/test-model zero-retry POST complete request then EOF [PREVIEW] [EXPECT-502]",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set('retryRequestId', pm.variables.replaceIn('{{$guid}}'));",
+                  "if (pm.variables.get('retryFixtureVK')) { pm.request.headers.upsert({ key: 'x-bf-vk', value: pm.variables.get('retryFixtureVK') }); }",
+                  "pm.test('Loopback fixture configured', function () {",
+                  "  pm.expect(pm.variables.get('retryFixtureUrl')).to.match(/^http:\\/\\/127\\.0\\.0\\.1:[0-9]+$/);",
+                  "});"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Connection failure is reported', function () {",
+                  "  pm.expect(pm.response.code, pm.response.text()).to.equal(502);",
+                  "  pm.expect(pm.response.json().error.type).to.equal('provider_connection_failed');",
+                  "});",
+                  "pm.sendRequest(pm.variables.get('retryFixtureUrl') + '/records?id=' + pm.variables.get('retryRequestId'), function (err, res) {",
+                  "  pm.test('Exactly one complete upstream request', function () {",
+                  "    pm.expect(err).to.equal(null);",
+                  "    pm.expect(res.code).to.equal(200);",
+                  "    var records = res.json();",
+                  "    pm.expect(records, JSON.stringify(records)).to.have.lengthOf(1);",
+                  "    pm.expect(records[0].method).to.equal('POST');",
+                  "    pm.expect(records[0].path).to.equal('/v1/chat/completions');",
+                  "    pm.expect(records[0].body).to.equal(\"{\\\"model\\\":\\\"test-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"disconnect\\\"}]}\");",
+                  "    pm.expect(records[0].complete_body_bytes).to.equal(74);",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-model-provider",
+                "value": "retry-test"
+              }
+            ],
+            "url": "{{baseUrl}}/openai_passthrough/chat/completions?id={{retryRequestId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"disconnect\"}]}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "76.02 openai/test-model zero-retry GET complete request then EOF [PREVIEW] [EXPECT-502]",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set('retryRequestId', pm.variables.replaceIn('{{$guid}}'));",
+                  "if (pm.variables.get('retryFixtureVK')) { pm.request.headers.upsert({ key: 'x-bf-vk', value: pm.variables.get('retryFixtureVK') }); }",
+                  "pm.test('Loopback fixture configured', function () {",
+                  "  pm.expect(pm.variables.get('retryFixtureUrl')).to.match(/^http:\\/\\/127\\.0\\.0\\.1:[0-9]+$/);",
+                  "});"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Connection failure is reported', function () {",
+                  "  pm.expect(pm.response.code, pm.response.text()).to.equal(502);",
+                  "  pm.expect(pm.response.json().error.type).to.equal('provider_connection_failed');",
+                  "});",
+                  "pm.sendRequest(pm.variables.get('retryFixtureUrl') + '/records?id=' + pm.variables.get('retryRequestId'), function (err, res) {",
+                  "  pm.test('Exactly one complete upstream request', function () {",
+                  "    pm.expect(err).to.equal(null);",
+                  "    pm.expect(res.code).to.equal(200);",
+                  "    var records = res.json();",
+                  "    pm.expect(records, JSON.stringify(records)).to.have.lengthOf(1);",
+                  "    pm.expect(records[0].method).to.equal('GET');",
+                  "    pm.expect(records[0].path).to.equal('/v1/user/balance');",
+                  "    pm.expect(records[0].body).to.equal(\"\");",
+                  "    pm.expect(records[0].complete_body_bytes).to.equal(0);",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-model-provider",
+                "value": "retry-test"
+              }
+            ],
+            "url": "{{baseUrl}}/openai_passthrough/user/balance?id={{retryRequestId}}"
+          }
+        }
+      ]
     }
   ]
 }
