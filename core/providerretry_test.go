@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -21,8 +22,8 @@ func TestProviderTransportRetryIsolation(t *testing.T) {
 	}{
 		{schemas.OpenAI, "", 1},
 		{"durian-deepseek", schemas.OpenAI, 1},
-		{schemas.DeepSeek, "", 4},
-		{schemas.Groq, "", 4},
+		{schemas.DeepSeek, "", 2},
+		{schemas.Groq, "", 2},
 	} {
 		t.Run(string(tc.name), func(t *testing.T) {
 			var received atomic.Int32
@@ -30,6 +31,11 @@ func TestProviderTransportRetryIsolation(t *testing.T) {
 				body, err := io.ReadAll(r.Body)
 				if err != nil || len(body) == 0 || r.Method != http.MethodPost {
 					t.Errorf("expected complete chat POST: method=%s body=%q err=%v", r.Method, body, err)
+				}
+				if strings.Contains(string(body), `"warm"`) {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"id":"warm","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+					return
 				}
 				received.Add(1)
 				conn, _, err := w.(http.Hijacker).Hijack()
@@ -52,14 +58,21 @@ func TestProviderTransportRetryIsolation(t *testing.T) {
 				t.Fatal(err)
 			}
 			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
-			response, bifrostErr := provider.ChatCompletion(ctx, schemas.Key{}, &schemas.BifrostChatRequest{
+			request := &schemas.BifrostChatRequest{
 				Provider: tc.name,
 				Model:    "test-model",
 				Input: []schemas.ChatMessage{{
 					Role:    schemas.ChatMessageRoleUser,
-					Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("disconnect")},
+					Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("warm")},
 				}},
-			})
+			}
+			// Upstream only retries reused connections. Warm each provider's client
+			// so this still distinguishes the custom zero-retry limit from its peers.
+			if response, err := provider.ChatCompletion(ctx, schemas.Key{}, request); response == nil || err != nil {
+				t.Fatalf("warm-up failed: response=%v error=%v", response, err)
+			}
+			request.Input[0].Content.ContentStr = schemas.Ptr("disconnect")
+			response, bifrostErr := provider.ChatCompletion(ctx, schemas.Key{}, request)
 			if response != nil || bifrostErr == nil {
 				t.Fatalf("expected connection failure: response=%v error=%v", response, bifrostErr)
 			}

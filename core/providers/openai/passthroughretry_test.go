@@ -95,9 +95,10 @@ func TestPassthroughRetryBudget(t *testing.T) {
 						mu.Lock()
 						defer mu.Unlock()
 						want := 1
-						if retries > 0 {
-							// Preserve the existing three transport retries per provider call.
-							want = 4
+						if retries > 0 && warm && fault != "body" {
+							// Upstream retries a reused connection before response headers,
+							// then stops on a fresh connection or a truncated response body.
+							want = 2
 						}
 						if len(addresses) != want {
 							t.Errorf("upstream received %d complete requests, want %d; connections=%v", len(addresses), want, addresses)
@@ -141,10 +142,8 @@ func TestPassthroughStreamRetryBudget(t *testing.T) {
 			if stream != nil || err == nil {
 				t.Fatalf("want stream setup failure, got stream=%v error=%v", stream, err)
 			}
+			// Upstream does not replay failures on a fresh connection.
 			want := int32(1)
-			if retries > 0 {
-				want = 4
-			}
 			if got := received.Load(); got != want {
 				t.Fatalf("upstream received %d complete requests, want %d", got, want)
 			}
