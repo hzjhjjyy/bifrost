@@ -60,6 +60,11 @@ func NewOpenAIProvider(config *schemas.ProviderConfig, logger schemas.Logger) *O
 	client = providerUtils.ConfigureProxy(client, config.ProxyConfig, logger)
 	client = providerUtils.ConfigureDialer(client, config.NetworkConfig.AllowPrivateNetwork)
 	client = providerUtils.ConfigureTLS(client, config.NetworkConfig, logger)
+	if config.NetworkConfig.MaxRetries == 0 {
+		// A connection failure can occur after the upstream has processed the request.
+		// Disable transport replays too when the provider's retry budget is zero.
+		client.MaxIdemponentCallAttempts = 1
+	}
 	streamingClient := providerUtils.BuildStreamingClient(client)
 	// Set default BaseURL if not provided
 	if config.NetworkConfig.BaseURL == "" {

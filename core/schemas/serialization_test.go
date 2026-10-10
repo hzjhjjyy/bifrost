@@ -1858,3 +1858,45 @@ func TestEmbeddingData_EncodingFormatSurvivesRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+// Pin the existing JSON/default contract: omitted and null max_retries are zero,
+// and explicit positive budgets survive normalization and persistence.
+func TestNetworkConfig_MaxRetriesDefaultsAndRoundTrip(t *testing.T) {
+	require.Equal(t, 0, DefaultMaxRetries)
+	require.Equal(t, 0, DefaultNetworkConfig.MaxRetries)
+	for _, tc := range []struct {
+		name, input string
+		want        int
+	}{
+		{"network_omitted", `{}`, 0},
+		{"network_null", `{"network_config":null}`, 0},
+		{"retries_omitted", `{"network_config":{}}`, 0},
+		{"retries_null", `{"network_config":{"max_retries":null}}`, 0},
+		{"zero", `{"network_config":{"max_retries":0}}`, 0},
+		{"one", `{"network_config":{"max_retries":1}}`, 1},
+		{"two", `{"network_config":{"max_retries":2}}`, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, decode := range []struct {
+				name string
+				fn   func([]byte, interface{}) error
+			}{{"json", json.Unmarshal}, {"sonic", Unmarshal}} {
+				t.Run(decode.name, func(t *testing.T) {
+					var config ProviderConfig
+					require.NoError(t, decode.fn([]byte(tc.input), &config))
+					require.Equal(t, tc.want, config.NetworkConfig.MaxRetries)
+					config.CheckAndSetDefaults()
+					config.CheckAndSetDefaults()
+					require.Equal(t, tc.want, config.NetworkConfig.MaxRetries)
+					data, err := Marshal(config)
+					require.NoError(t, err)
+					require.Contains(t, string(data), `"max_retries":`)
+					var restored ProviderConfig
+					require.NoError(t, decode.fn(data, &restored))
+					restored.CheckAndSetDefaults()
+					require.Equal(t, tc.want, restored.NetworkConfig.MaxRetries)
+				})
+			}
+		})
+	}
+}

@@ -4411,3 +4411,160 @@ func TestFallbackPinOutsideAllowedKeysIsRefused(t *testing.T) {
 		}
 	}
 }
+
+// Provider names and wire compatibility do not determine which HTTP client is
+// used: custom providers select their implementation through BaseProviderType.
+func TestProviderTransportRetryIsolation(t *testing.T) {
+	for _, tc := range []struct {
+		name     schemas.ModelProvider
+		base     schemas.ModelProvider
+		attempts int32
+	}{
+		{schemas.OpenAI, "", 1},
+		{"durian-deepseek", schemas.OpenAI, 1},
+		{schemas.DeepSeek, "", 2},
+		{schemas.Groq, "", 2},
+	} {
+		t.Run(string(tc.name), func(t *testing.T) {
+			var received atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil || len(body) == 0 || r.Method != http.MethodPost {
+					t.Errorf("expected complete chat POST: method=%s body=%q err=%v", r.Method, body, err)
+				}
+				if strings.Contains(string(body), `"warm"`) {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"id":"warm","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+					return
+				}
+				received.Add(1)
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Errorf("hijack: %v", err)
+					return
+				}
+				_ = conn.Close()
+			}))
+			defer server.Close()
+			config := &schemas.ProviderConfig{
+				NetworkConfig: schemas.NetworkConfig{BaseURL: server.URL, MaxRetries: 0, DefaultRequestTimeoutInSeconds: 2},
+			}
+			if tc.base != "" {
+				config.CustomProviderConfig = &schemas.CustomProviderConfig{BaseProviderType: tc.base}
+			}
+			client := &Bifrost{logger: NewDefaultLogger(schemas.LogLevelError)}
+			provider, err := client.createBaseProvider(tc.name, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			request := &schemas.BifrostChatRequest{
+				Provider: tc.name,
+				Model:    "test-model",
+				Input: []schemas.ChatMessage{{
+					Role:    schemas.ChatMessageRoleUser,
+					Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("warm")},
+				}},
+			}
+			// Upstream only retries reused connections. Warm each provider's client
+			// so this still distinguishes the custom zero-retry limit from its peers.
+			if response, err := provider.ChatCompletion(ctx, schemas.Key{}, request); response == nil || err != nil {
+				t.Fatalf("warm-up failed: response=%v error=%v", response, err)
+			}
+			request.Input[0].Content.ContentStr = schemas.Ptr("disconnect")
+			response, bifrostErr := provider.ChatCompletion(ctx, schemas.Key{}, request)
+			if response != nil || bifrostErr == nil {
+				t.Fatalf("expected connection failure: response=%v error=%v", response, bifrostErr)
+			}
+			if got := received.Load(); got != tc.attempts {
+				t.Fatalf("upstream received %d complete requests, want %d", got, tc.attempts)
+			}
+		})
+	}
+}
+
+// Exercise JSON parsing -> provider defaults -> core retry loop -> real HTTP.
+// No key rotation, fallbacks or fail-soft replay is involved in these failures.
+func TestExecuteRequestWithRetries_ConfiguredHTTPBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name, input string
+		retries     int
+	}{
+		{"network_omitted", `{}`, 0},
+		{"retries_omitted", `{"network_config":{}}`, 0},
+		{"zero", `{"network_config":{"max_retries":0}}`, 0},
+		{"one", `{"network_config":{"max_retries":1}}`, 1},
+		{"two", `{"network_config":{"max_retries":2}}`, 2},
+	} {
+		for _, fault := range []string{"429", "503", "disconnect", "recover"} {
+			t.Run(tc.name+"/"+fault, func(t *testing.T) {
+				var received atomic.Int32
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if _, err := io.Copy(io.Discard, r.Body); err != nil {
+						t.Error(err)
+					}
+					attempt := received.Add(1)
+					if fault == "disconnect" {
+						conn, _, err := w.(http.Hijacker).Hijack()
+						if err != nil {
+							t.Error(err)
+							return
+						}
+						_ = conn.Close()
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					if fault == "recover" && attempt > 1 {
+						_, _ = io.WriteString(w, `{"id":"ok","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+						return
+					}
+					status := http.StatusServiceUnavailable
+					if fault == "429" {
+						status = http.StatusTooManyRequests
+					}
+					w.WriteHeader(status)
+					_, _ = io.WriteString(w, `{"error":{"message":"temporary failure","type":"server_error"}}`)
+				}))
+				defer server.Close()
+				var config schemas.ProviderConfig
+				if err := schemas.Unmarshal([]byte(tc.input), &config); err != nil {
+					t.Fatal(err)
+				}
+				config.NetworkConfig.BaseURL = server.URL
+				config.NetworkConfig.RetryBackoffInitial = time.Millisecond
+				config.NetworkConfig.RetryBackoffMax = time.Millisecond
+				client := &Bifrost{logger: NewDefaultLogger(schemas.LogLevelError)}
+				provider, err := client.createBaseProvider(schemas.OpenAI, &config)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+				ctx.SetValue(schemas.BifrostContextKeyTracer, &schemas.NoOpTracer{})
+				request := &schemas.BifrostChatRequest{
+					Provider: schemas.OpenAI, Model: "test-model",
+					Input: []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("retry")}}},
+				}
+				result, bifrostErr := executeRequestWithRetries(ctx, &config,
+					func(key schemas.Key) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
+						return provider.ChatCompletion(ctx, key, request)
+					},
+					nil, schemas.ChatCompletionRequest, schemas.OpenAI, "test-model", nil, client.logger)
+				want := tc.retries + 1
+				if fault == "recover" && tc.retries > 0 {
+					want = 2
+					if result == nil || bifrostErr != nil {
+						t.Fatalf("expected recovery, response=%v error=%v", result, bifrostErr)
+					}
+				} else if result != nil || bifrostErr == nil {
+					t.Fatalf("expected failure, response=%v error=%v", result, bifrostErr)
+				}
+				if got := int(received.Load()); got != want {
+					t.Fatalf("upstream received %d requests, want %d", got, want)
+				}
+				if got := ctx.Value(schemas.BifrostContextKeyNumberOfRetries); got != want-1 {
+					t.Fatalf("recorded retries=%v, want %d", got, want-1)
+				}
+			})
+		}
+	}
+}
