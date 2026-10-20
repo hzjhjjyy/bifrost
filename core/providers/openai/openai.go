@@ -8138,6 +8138,8 @@ func (provider *OpenAIProvider) Passthrough(
 	for k, v := range req.SafeHeaders {
 		fasthttpReq.Header.Set(k, v)
 	}
+	// Consume gateway control metadata even when extra-header settings inject it.
+	fasthttpReq.Header.Del(schemas.PassthroughPathModeHeader)
 
 	if key.Value.GetValue() != "" {
 		fasthttpReq.Header.Set("Authorization", "Bearer "+key.Value.GetValue())
@@ -8183,8 +8185,10 @@ func (provider *OpenAIProvider) Passthrough(
 func (provider *OpenAIProvider) buildPassthroughURL(req *schemas.BifrostPassthroughRequest) string {
 	path := req.Path
 	baseURL := provider.networkConfig.BaseURL
-	if req.UpstreamURL != "" {
-		baseURL = strings.TrimRight(req.UpstreamURL, "/")
+	if req.UpstreamURL != "" || req.PreservePath {
+		if req.UpstreamURL != "" {
+			baseURL = strings.TrimRight(req.UpstreamURL, "/")
+		}
 		if !strings.HasPrefix(path, "/") {
 			path = "/" + path
 		}
@@ -8235,6 +8239,8 @@ func (provider *OpenAIProvider) PassthroughStream(
 	for k, v := range req.SafeHeaders {
 		fasthttpReq.Header.Set(k, v)
 	}
+	// Consume gateway control metadata even when extra-header settings inject it.
+	fasthttpReq.Header.Del(schemas.PassthroughPathModeHeader)
 
 	fasthttpReq.Header.Set("Connection", "close")
 

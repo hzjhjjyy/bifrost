@@ -9,8 +9,10 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1017,5 +1019,304 @@ func (c *cancelRecorder) requireCancelled(t *testing.T, msg string) {
 	case <-c.done:
 	case <-time.After(5 * time.Second):
 		t.Fatal(msg)
+	}
+}
+
+// passthroughPathTestAccount supplies only public fixture credentials to real providers.
+type passthroughPathTestAccount struct {
+	baseURL string
+}
+
+func (a *passthroughPathTestAccount) GetConfiguredProviders() ([]schemas.ModelProvider, error) {
+	return []schemas.ModelProvider{"path-test", schemas.OpenAI, schemas.DeepSeek, schemas.Anthropic, "anthropic-path-test"}, nil
+}
+
+func (a *passthroughPathTestAccount) GetKeysForProvider(_ context.Context, _ schemas.ModelProvider) ([]schemas.Key, error) {
+	return []schemas.Key{{ID: "path-test-key", Value: *schemas.NewSecretVar("public-upstream-key"), Weight: 1, Models: schemas.WhiteList{"*"}}}, nil
+}
+
+func (a *passthroughPathTestAccount) GetConfigForProvider(provider schemas.ModelProvider) (*schemas.ProviderConfig, error) {
+	config := &schemas.ProviderConfig{
+		NetworkConfig: schemas.NetworkConfig{
+			BaseURL: a.baseURL, MaxRetries: 0, DefaultRequestTimeoutInSeconds: 5,
+			ExtraHeaders: map[string]string{"x-bf-passthrough-path-mode": "configured-internal-value", "X-Configured": "fixture"},
+		},
+		ConcurrencyAndBufferSize: schemas.ConcurrencyAndBufferSize{Concurrency: 4, BufferSize: 32},
+	}
+	if provider == "path-test" {
+		config.CustomProviderConfig = &schemas.CustomProviderConfig{BaseProviderType: schemas.OpenAI}
+	} else if provider == "anthropic-path-test" {
+		config.CustomProviderConfig = &schemas.CustomProviderConfig{BaseProviderType: schemas.Anthropic}
+	}
+	return config, nil
+}
+
+// startPassthroughPathGateway exercises the public HTTP seam with the actual core/provider.
+func startPassthroughPathGateway(t *testing.T, basePath string, upstream http.HandlerFunc) string {
+	t.Helper()
+	mock := httptest.NewServer(upstream)
+	t.Cleanup(mock.Close)
+	client, err := bifrost.Init(t.Context(), schemas.BifrostConfig{
+		Account: &passthroughPathTestAccount{baseURL: mock.URL + basePath},
+		Logger:  &testLogger{}, InitialPoolSize: 1,
+	})
+	require.NoError(t, err)
+	t.Cleanup(client.Shutdown)
+	r := router.New()
+	NewOpenAIPassthroughRouter(client, &mockHandlerStore{}, nil, &testLogger{}).RegisterRoutes(r)
+	NewAnthropicPassthroughRouter(client, &mockHandlerStore{}, nil, &testLogger{}).RegisterRoutes(r)
+	NewGenericRouter(client, &mockHandlerStore{}, nil, CreateOpenAIRouteConfigs("/v1", &mockHandlerStore{}), nil, &testLogger{}).RegisterRoutes(r)
+	NewPassthroughRouter(client, &mockHandlerStore{}, nil, &testLogger{}, &PassthroughConfig{
+		Provider: schemas.OpenAI, UpstreamURL: mock.URL + "/fixed", StripPrefix: []string{"/fixed_passthrough"},
+	}).RegisterRoutes(r)
+	server := &fasthttp.Server{Handler: r.Handler}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = server.Serve(ln)
+	}()
+	t.Cleanup(func() {
+		require.NoError(t, server.Shutdown())
+		<-done
+	})
+	return "http://" + ln.Addr().String()
+}
+
+func TestOpenAIPassthroughPathModePreservesBalancePath(t *testing.T) {
+	paths := make(chan string, 4)
+	gateway := startPassthroughPathGateway(t, "", func(w http.ResponseWriter, r *http.Request) {
+		paths <- r.URL.RequestURI()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"is_available":true,"balance_infos":[]}`)
+	})
+	req, err := http.NewRequest(http.MethodGet, gateway+"/openai_passthrough/user/balance?currency=CNY", nil)
+	require.NoError(t, err)
+	req.Header.Set("x-model-provider", "path-test")
+	req.Header.Set("x-bf-passthrough-path-mode", "preserve")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	require.Equal(t, "/user/balance?currency=CNY", <-paths)
+}
+
+func TestOpenAIPassthroughPathModeRejectsInvalidHeaders(t *testing.T) {
+	var calls atomic.Int32
+	gateway := startPassthroughPathGateway(t, "", func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = io.WriteString(w, `{}`)
+	})
+	client := &http.Client{Timeout: 10 * time.Second}
+	for _, values := range [][]string{{""}, {"default"}, {"PRESERVE"}, {"preserve", "unknown"}, {"", "preserve"}, {"preserve", ""}, {"preserve,unknown"}, {"preserve,"}} {
+		t.Run(fmt.Sprintf("%q", values), func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, gateway+"/openai_passthrough/user/balance", nil)
+			require.NoError(t, err)
+			req.Header.Set("x-model-provider", "path-test")
+			for _, value := range values {
+				req.Header.Add("x-bf-passthrough-path-mode", value)
+			}
+			resp, err := client.Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode, string(body))
+			require.Contains(t, string(body), "x-bf-passthrough-path-mode")
+		})
+	}
+	require.Zero(t, calls.Load(), "invalid headers must fail before upstream dispatch")
+}
+
+func TestOpenAIPassthroughPathModeForwardsRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name, basePath, suffix, want string
+		values                       []string
+	}{
+		{"default", "", "/chat/completions", "/v1/chat/completions", nil},
+		{"default explicit v1", "", "/v1/chat/completions", "/v1/chat/completions", nil},
+		{"preserve", "", "/user/balance", "/user/balance", []string{"preserve"}},
+		{"explicit v1", "", "/v1/chat/completions", "/v1/chat/completions", []string{"preserve"}},
+		{"base prefix", "/gateway/", "/user/balance", "/gateway/user/balance", []string{"preserve"}},
+		{"base v1 retained", "/v1", "/user/balance", "/v1/user/balance", []string{"preserve"}},
+		{"duplicate", "", "/user/balance", "/user/balance", []string{"preserve", "preserve"}},
+		{"comma and whitespace", "", "/user/balance", "/user/balance", []string{" \tpreserve , preserve\t "}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const query = "currency=CNY&tag=a%2Fb&tag=c+d"
+			const payload = `{"model":"test-model", "messages":[],"extra":{"keep":true}}`
+			const response = `{"error":{"message":"fixture rate limit"}}`
+			var calls atomic.Int32
+			gateway := startPassthroughPathGateway(t, tc.basePath, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				assert.Equal(t, tc.want+"?"+query, r.URL.RequestURI())
+				assert.Equal(t, http.MethodPost, r.Method)
+				assert.Empty(t, r.Header.Values("x-bf-passthrough-path-mode"))
+				assert.Equal(t, "fixture", r.Header.Get("X-Configured"))
+				assert.Equal(t, "keep-me", r.Header.Get("X-Request-Marker"))
+				assert.Equal(t, "Bearer public-upstream-key", r.Header.Get("Authorization"))
+				body, err := io.ReadAll(r.Body)
+				assert.NoError(t, err)
+				assert.Equal(t, payload, string(body))
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", "2")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = io.WriteString(w, response)
+			})
+			req, err := http.NewRequest(http.MethodPost, gateway+"/openai_passthrough"+tc.suffix+"?"+query, strings.NewReader(payload))
+			require.NoError(t, err)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("x-model-provider", "path-test")
+			req.Header.Set("X-Request-Marker", "keep-me")
+			// Extra headers must not smuggle the consumed control header upstream.
+			req.Header.Set("x-bf-eh-x-bf-passthrough-path-mode", "request-internal-value")
+			for _, value := range tc.values {
+				req.Header.Add("X-Bf-Passthrough-Path-Mode", value)
+			}
+			client := &http.Client{Timeout: 10 * time.Second}
+			resp, err := client.Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusTooManyRequests, resp.StatusCode, string(body))
+			require.Equal(t, response, string(body))
+			require.Equal(t, "2", resp.Header.Get("Retry-After"))
+			require.EqualValues(t, 1, calls.Load(), "max_retries=0 must send exactly once")
+		})
+	}
+}
+
+func TestOpenAIPassthroughPathModeConcurrentUnaryAndSSE(t *testing.T) {
+	gateway := startPassthroughPathGateway(t, "/gateway", func(w http.ResponseWriter, r *http.Request) {
+		assert.Empty(t, r.Header.Values("x-bf-passthrough-path-mode"))
+		assert.Equal(t, "Bearer public-upstream-key", r.Header.Get("Authorization"))
+		body, err := io.ReadAll(r.Body)
+		assert.NoError(t, err)
+		if strings.Contains(string(body), `"stream":true`) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "data: {\"path\":%q}\n\ndata: [DONE]\n\n", r.URL.RequestURI())
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"path":%q}`, r.URL.RequestURI())
+		}
+	})
+	client := &http.Client{Timeout: 10 * time.Second}
+	for i := range 16 {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			t.Parallel()
+			stream, preserve := i%2 == 0, i%4 < 2
+			payload := fmt.Sprintf(`{"model":"test-model","stream":%t}`, stream)
+			suffix := fmt.Sprintf("/chat/completions?id=%d", i)
+			req, err := http.NewRequest(http.MethodPost, gateway+"/openai_passthrough"+suffix, strings.NewReader(payload))
+			require.NoError(t, err)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("x-model-provider", "path-test")
+			wantPath := "/gateway/v1" + suffix
+			if preserve {
+				req.Header.Set("x-bf-passthrough-path-mode", "preserve")
+				wantPath = "/gateway" + suffix
+			}
+			resp, err := client.Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			wantBody := fmt.Sprintf(`{"path":%q}`, wantPath)
+			if stream {
+				require.Contains(t, resp.Header.Get("Content-Type"), "text/event-stream")
+				wantBody = "data: " + wantBody + "\n\ndata: [DONE]\n\n"
+			}
+			require.Equal(t, wantBody, string(body))
+		})
+	}
+}
+
+func TestOpenAIPassthroughPathModeDoesNotChangeOtherRoutes(t *testing.T) {
+	paths := make(chan string, 4)
+	gateway := startPassthroughPathGateway(t, "", func(w http.ResponseWriter, r *http.Request) {
+		paths <- r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"fixture","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	})
+	for _, tc := range []struct{ name, path, provider, want string }{
+		{"native OpenAI", "/v1/chat/completions", "openai", "/v1/chat/completions"},
+		{"native DeepSeek", "/v1/chat/completions", "deepseek", "/chat/completions"},
+		{"other passthrough", "/anthropic_passthrough/chat/completions", "path-test", "/v1/chat/completions"},
+		{"resolved Anthropic", "/openai_passthrough/v1/messages", "anthropic", "/v1/messages"},
+		{"resolved custom Anthropic", "/openai_passthrough/v1/messages", "anthropic-path-test", "/v1/messages"},
+		{"fixed upstream", "/fixed_passthrough/chat/completions", "path-test", "/fixed/chat/completions"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, value := range []string{"preserve", "invalid-is-ignored-on-other-routes"} {
+				payload := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}]}`, tc.provider+"/test-model")
+				req, err := http.NewRequest(http.MethodPost, gateway+tc.path, strings.NewReader(payload))
+				require.NoError(t, err)
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("x-model-provider", tc.provider)
+				req.Header.Set("x-bf-passthrough-path-mode", value)
+				client := &http.Client{Timeout: 10 * time.Second}
+				resp, err := client.Do(req)
+				require.NoError(t, err)
+				body, err := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				require.NoError(t, err)
+				require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+				require.Equal(t, tc.want, <-paths)
+			}
+		})
+	}
+}
+
+func TestOpenAIPassthroughPathModeZeroRetriesOnDisconnect(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, preserve := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/preserve=%t", stream, preserve), func(t *testing.T) {
+				var calls atomic.Int32
+				wantPath := "/v1/chat/completions"
+				if preserve {
+					wantPath = "/chat/completions"
+				}
+				gateway := startPassthroughPathGateway(t, "", func(w http.ResponseWriter, r *http.Request) {
+					body, err := io.ReadAll(r.Body)
+					assert.NoError(t, err)
+					assert.Contains(t, string(body), `"model":"test-model"`)
+					assert.Equal(t, wantPath, r.URL.Path)
+					calls.Add(1)
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if assert.NoError(t, err) {
+						_ = conn.Close()
+					}
+				})
+				payload := fmt.Sprintf(`{"model":"test-model","stream":%t}`, stream)
+				req, err := http.NewRequest(http.MethodPost, gateway+"/openai_passthrough/chat/completions", strings.NewReader(payload))
+				require.NoError(t, err)
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("x-model-provider", "path-test")
+				if preserve {
+					req.Header.Set("x-bf-passthrough-path-mode", "preserve")
+				}
+				client := &http.Client{Timeout: 10 * time.Second}
+				resp, err := client.Do(req)
+				require.NoError(t, err)
+				defer resp.Body.Close()
+				body, err := io.ReadAll(resp.Body)
+				require.NoError(t, err)
+				// Preserve the fork's existing error mapping as well as its retry policy.
+				if stream {
+					require.Equal(t, http.StatusInternalServerError, resp.StatusCode, string(body))
+					require.Contains(t, string(body), "failed to execute HTTP request to provider API")
+				} else {
+					require.Equal(t, http.StatusBadGateway, resp.StatusCode, string(body))
+					require.Contains(t, string(body), "provider_connection_failed")
+				}
+				require.EqualValues(t, 1, calls.Load(), "a disconnected upstream must not cause a hidden replay")
+			})
+		}
 	}
 }

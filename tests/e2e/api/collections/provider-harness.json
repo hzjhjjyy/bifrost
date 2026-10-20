@@ -147,5 +147,189 @@
       }
     }
   ]
+},
+{
+  "name": "145. OpenAI passthrough path mode",
+  "description": "Local-only: start fixtures/path-mode.py on loopback and configure path-test as an OpenAI-based custom provider with max_retries=0 and synthetic credentials. INCLUDE_PREVIEW=1 opts in. Assert the actual upstream path, body, consumed header, and SSE response. Ordinary paid-provider sweeps exclude these cases.",
+  "item": [
+    {
+      "name": "145.01 openai/test-model passthrough path mode preserve balance [PREVIEW]",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Path mode response', function () {",
+              "  pm.expect(pm.response.code, pm.response.text()).to.equal(200);",
+              "  var record = pm.response.json();",
+              "  pm.expect(record.body).to.equal('');",
+              "  pm.expect(record.path).to.equal('/user/balance?currency=CNY');",
+              "  pm.expect(record.method).to.equal('GET');",
+              "  pm.expect(record.control_header).to.equal(null);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "x-model-provider",
+            "value": "path-test"
+          },
+          {
+            "key": "x-bf-passthrough-path-mode",
+            "value": "preserve"
+          }
+        ],
+        "url": "{{baseUrl}}/openai_passthrough/user/balance?currency=CNY"
+      }
+    },
+    {
+      "name": "145.02 openai/test-model passthrough path mode default prefix [PREVIEW]",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Path mode response', function () {",
+              "  pm.expect(pm.response.code, pm.response.text()).to.equal(200);",
+              "  var record = pm.response.json();",
+              "  pm.expect(record.body).to.equal('');",
+              "  pm.expect(record.path).to.equal('/v1/user/balance?currency=CNY');",
+              "  pm.expect(record.method).to.equal('GET');",
+              "  pm.expect(record.control_header).to.equal(null);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "x-model-provider",
+            "value": "path-test"
+          }
+        ],
+        "url": "{{baseUrl}}/openai_passthrough/user/balance?currency=CNY"
+      }
+    },
+    {
+      "name": "145.03 openai/test-model passthrough path mode preserve SSE [PREVIEW]",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Path mode response', function () {",
+              "  pm.expect(pm.response.code, pm.response.text()).to.equal(200);",
+              "  pm.expect(pm.response.headers.get('Content-Type')).to.include('text/event-stream');",
+              "  var events = pm.response.text().split('\\n').filter(function (line) { return line.indexOf('data: ') === 0; });",
+              "  pm.expect(events[events.length - 1]).to.equal('data: [DONE]');",
+              "  var record = JSON.parse(events[0].slice(6));",
+              "  pm.expect(record.body).to.equal(pm.request.body.raw);",
+              "  pm.expect(record.path).to.equal('/chat/completions');",
+              "  pm.expect(record.method).to.equal('POST');",
+              "  pm.expect(record.control_header).to.equal(null);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "x-model-provider",
+            "value": "path-test"
+          },
+          {
+            "key": "x-bf-passthrough-path-mode",
+            "value": "preserve"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/openai_passthrough/chat/completions",
+        "body": {
+          "mode": "raw",
+          "raw": "{\"model\":\"test-model\",\"stream\":true}"
+        }
+      }
+    },
+    {
+      "name": "145.04 openai/test-model passthrough path mode preserve explicit v1 [PREVIEW]",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Path mode response', function () {",
+              "  pm.expect(pm.response.code, pm.response.text()).to.equal(200);",
+              "  var record = pm.response.json();",
+              "  pm.expect(record.body).to.equal('');",
+              "  pm.expect(record.path).to.equal('/v1/user/balance');",
+              "  pm.expect(record.method).to.equal('GET');",
+              "  pm.expect(record.control_header).to.equal(null);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "x-model-provider",
+            "value": "path-test"
+          },
+          {
+            "key": "x-bf-passthrough-path-mode",
+            "value": "preserve"
+          }
+        ],
+        "url": "{{baseUrl}}/openai_passthrough/v1/user/balance"
+      }
+    },
+    {
+      "name": "145.05 openai/test-model passthrough path mode rejects unknown value [PREVIEW] [EXPECT-400]",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "x-model-provider",
+            "value": "path-test"
+          },
+          {
+            "key": "x-bf-passthrough-path-mode",
+            "value": "unknown"
+          }
+        ],
+        "url": "{{baseUrl}}/openai_passthrough/user/balance"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Invalid path mode rejected', function () {",
+              "  pm.expect(pm.response.code, pm.response.text()).to.equal(400);",
+              "  pm.expect(pm.response.json().error.message).to.include('x-bf-passthrough-path-mode');",
+              "});"
+            ]
+          }
+        }
+      ]
+    }
+  ]
 }
 ]}

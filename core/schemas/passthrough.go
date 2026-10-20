@@ -1,14 +1,18 @@
 package schemas
 
+// PassthroughPathModeHeader controls OpenAI passthrough path prefixing per request.
+const PassthroughPathModeHeader = "x-bf-passthrough-path-mode"
+
 type BifrostPassthroughRequest struct {
-	Provider    ModelProvider // provider extracted from path or body, used for key selection when non-empty
-	Model       string        // model extracted from path or body, used for key selection when non-empty
-	Method      string
-	Path        string // stripped path, e.g. "/v1/fine-tuning/jobs"
-	RawQuery    string // raw query string, no "?"
-	UpstreamURL string // optional base URL override for host-backed passthrough routes
-	Body        []byte
-	SafeHeaders map[string]string // client headers; auth stripped unless the caller's OAuth/JWT bearer is the upstream credential (Anthropic sk-ant-oat, OpenAI JWT)
+	Provider     ModelProvider // provider extracted from path or body, used for key selection when non-empty
+	Model        string        // model extracted from path or body, used for key selection when non-empty
+	Method       string
+	Path         string // stripped path, e.g. "/v1/fine-tuning/jobs"
+	PreservePath bool   // OpenAI passthrough: do not add or remove the /v1 prefix
+	RawQuery     string // raw query string, no "?"
+	UpstreamURL  string // optional base URL override for host-backed passthrough routes
+	Body         []byte
+	SafeHeaders  map[string]string // client headers; auth stripped unless the caller's OAuth/JWT bearer is the upstream credential (Anthropic sk-ant-oat, OpenAI JWT)
 }
 
 // BifrostPassthroughUsage carries usage data extracted by the provider at stream

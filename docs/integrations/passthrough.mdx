@@ -49,6 +49,53 @@ Claude Code OAuth sign-in (`Authorization: Bearer sk-ant-oat…`) is handled sep
 
 - Uses `openai` as the default provider.
 
+### Preserve the OpenAI passthrough path
+
+By default, OpenAI passthrough adds `/v1` to the path sent upstream (and avoids
+adding it twice when the request already starts with `/v1`). To call a path such
+as `/user/balance`, set this request header:
+
+```http
+x-bf-passthrough-path-mode: preserve
+```
+
+This applies only to `/openai_passthrough` with OpenAI or an OpenAI-based custom
+provider. It leaves the parsed path after `/openai_passthrough` unchanged with
+respect to `/v1`, joins it to the configured base URL, and keeps the existing
+query handling. For a base URL of `https://api.example.com`:
+
+| Request path | Header | Upstream path |
+| --- | --- | --- |
+| `/openai_passthrough/chat/completions` | Absent | `/v1/chat/completions` |
+| `/openai_passthrough/user/balance` | `preserve` | `/user/balance` |
+| `/openai_passthrough/v1/chat/completions` | `preserve` | `/v1/chat/completions` |
+
+A base URL prefix is also retained: `https://api.example.com/gateway` plus
+`/user/balance` becomes `https://api.example.com/gateway/user/balance`. If the base
+URL already ends in `/v1`, `preserve` does not remove that configured prefix.
+Existing HTTP path parsing and normalization still apply; this option does not
+promise byte-for-byte URI preservation.
+
+For example, with an OpenAI-based custom provider named `balance-api`:
+
+```bash
+curl "http://localhost:8080/openai_passthrough/user/balance?currency=CNY" \
+  -H "x-model-provider: balance-api" \
+  -H "x-bf-vk: <YOUR-BIFROST-VIRTUAL-KEY>" \
+  -H "x-bf-passthrough-path-mode: preserve"
+```
+
+The value must be lowercase `preserve`; surrounding spaces or tabs and repeated
+identical values are accepted. An empty value, unknown value, or conflicting
+repeated values returns HTTP 400 before contacting the provider. Omit the header
+to use the default behavior.
+
+The gateway consumes this header, including copies injected through extra-header
+configuration. The option works for both ordinary and streaming requests and
+changes only the path prefix policy. Native OpenAI/DeepSeek APIs, other passthrough
+routes, and fixed-upstream ChatGPT passthrough retain their existing behavior.
+Key selection, retry policy (including `max_retries: 0`), and timeouts are unchanged.
+
 ### Anthropic Passthrough
 
 - Uses `anthropic` as the default provider.

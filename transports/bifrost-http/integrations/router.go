@@ -64,6 +64,7 @@ import (
 	"github.com/fasthttp/router"
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/providers/bedrock"
+	"github.com/maximhq/bifrost/core/providers/openai"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/logstore"
 	"github.com/maximhq/bifrost/framework/modelcatalog"
@@ -3484,8 +3485,6 @@ func (g *GenericRouter) handlePassthrough(ctx *fasthttp.RequestCtx) {
 		return true
 	})
 
-	bifrostCtx, cancel := lib.ConvertToBifrostContext(ctx, g.handlerStore)
-
 	path := string(ctx.Path())
 	for _, prefix := range g.passthroughCfg.StripPrefix {
 		if strings.HasPrefix(path, prefix) {
@@ -3504,18 +3503,39 @@ func (g *GenericRouter) handlePassthrough(ctx *fasthttp.RequestCtx) {
 		provider = cfg.ProviderDetector(ctx, bodyModel)
 	}
 	provider = getProviderFromHeader(ctx, provider)
+	preservePath := false
+	// Check both the entrypoint and the resolved implementation: x-model-provider
+	// can select a non-OpenAI provider even on /openai_passthrough.
+	modeValues := ctx.Request.Header.PeekAll(schemas.PassthroughPathModeHeader)
+	if cfg.Provider == schemas.OpenAI && cfg.UpstreamURL == "" && len(modeValues) > 0 {
+		if _, isOpenAI := g.client.GetProviderByKey(provider).(*openai.OpenAIProvider); isOpenAI {
+			for _, value := range modeValues {
+				for token := range strings.SplitSeq(string(value), ",") {
+					if strings.Trim(token, " \t") != "preserve" {
+						g.sendError(ctx, nil, func(_ *schemas.BifrostContext, err *schemas.BifrostError) interface{} {
+							return err
+						}, newBifrostErrorWithCode(nil, schemas.PassthroughPathModeHeader+" must be preserve when present", fasthttp.StatusBadRequest))
+						return
+					}
+					preservePath = true
+				}
+			}
+		}
+	}
+	bifrostCtx, cancel := lib.ConvertToBifrostContext(ctx, g.handlerStore)
 	applyPassthroughCallerAuth(bifrostCtx, safeHeaders, provider, callerAuth, cfg.UpstreamURL)
 	isStreaming := strings.Contains(strings.ToLower(path), "stream") || bodyStream
 
 	passthroughReq := &schemas.BifrostPassthroughRequest{
-		Method:      string(ctx.Method()),
-		Path:        path,
-		RawQuery:    string(ctx.URI().QueryString()),
-		UpstreamURL: cfg.UpstreamURL,
-		Body:        body,
-		SafeHeaders: safeHeaders,
-		Provider:    provider,
-		Model:       resolvedModel,
+		Method:       string(ctx.Method()),
+		Path:         path,
+		RawQuery:     string(ctx.URI().QueryString()),
+		UpstreamURL:  cfg.UpstreamURL,
+		PreservePath: preservePath,
+		Body:         body,
+		SafeHeaders:  safeHeaders,
+		Provider:     provider,
+		Model:        resolvedModel,
 	}
 
 	if isStreaming {
